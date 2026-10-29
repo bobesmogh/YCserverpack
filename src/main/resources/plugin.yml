@@ -1,0 +1,13 @@
+name: NetherBlight
+version: 1.0.0
+main: yardcraft.netherblight.NetherBlight
+api-version: "26.2"
+description: Незер-заражение верхнего мира для игроков, побывавших в Незере
+commands:
+  netherblight:
+    description: Управление заражением
+    usage: /netherblight run | mark <игрок> | unmark <игрок> | reload
+    permission: netherblight.admin
+permissions:
+  netherblight.admin:
+    default: op
