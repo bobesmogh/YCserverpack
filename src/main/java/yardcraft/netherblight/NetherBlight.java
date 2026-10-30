@@ -54,7 +54,8 @@ public class NetherBlight extends JavaPlugin implements Listener {
     private String soundKey;
     private float soundVolume, soundPitch;
     private boolean lightningEnabled, lightningReal;
-    private int lightningPerPlayer, lightningMaxDelay;
+    private int lightningPerPlayer, lightningBlockDelay;
+    private long nextCycleAt;
 
     @Override
     public void onEnable() {
@@ -89,7 +90,7 @@ public class NetherBlight extends JavaPlugin implements Listener {
         lightningEnabled = getConfig().getBoolean("lightning.enabled", true);
         lightningReal = getConfig().getBoolean("lightning.real", false);
         lightningPerPlayer = Math.max(0, getConfig().getInt("lightning.per-player-per-cycle", 3));
-        lightningMaxDelay = Math.max(0, getConfig().getInt("lightning.max-delay-ticks", 100));
+        lightningBlockDelay = Math.max(0, getConfig().getInt("lightning.block-delay-ticks", 20));
 
         palette.clear();
         totalWeight = 0;
@@ -137,6 +138,9 @@ public class NetherBlight extends JavaPlugin implements Listener {
     private void scheduleNext() {
         double minutes = minMinutes + rnd.nextDouble() * (maxMinutes - minMinutes);
         long ticks = Math.max(20L, (long) (minutes * 60 * 20));
+        nextCycleAt = System.currentTimeMillis() + ticks * 50L;
+        getLogger().info(String.format("Следующий цикл заражения через %.1f мин.", ticks / 1200.0));
+        if (nextCycle != null) nextCycle.cancel();
         nextCycle = Bukkit.getScheduler().runTaskLater(this, () -> {
             runCycle();
             scheduleNext();
@@ -179,6 +183,7 @@ public class NetherBlight extends JavaPlugin implements Listener {
             }
         }
 
+        getLogger().info("Цикл заражения: игроков " + players + ", чанков " + chunks.size());
         queue.addAll(chunks);
         if (!queue.isEmpty() && (worker == null || worker.isCancelled())) {
             worker = Bukkit.getScheduler().runTaskTimer(this, this::work, 1L, 1L);
@@ -201,7 +206,40 @@ public class NetherBlight extends JavaPlugin implements Listener {
         World w = ref.world();
         boolean wantsStrike = lightningChunks.remove(ref);
         if (!w.isChunkLoaded(ref.x(), ref.z())) return; // только загруженные
-        Block strike = null;
+
+        if (wantsStrike) {
+            Block target = findGrass(w, ref);
+            if (target != null) {
+                // 1) сначала молния
+                Location loc = target.getLocation().add(0.5, 1, 0.5);
+                if (lightningReal) {
+                    w.strikeLightning(loc);
+                } else {
+                    w.strikeLightningEffect(loc); // вспышка и гром без урона и огня
+                }
+                // 2) блоки меняются уже после удара
+                Bukkit.getScheduler().runTaskLater(this, () -> infectChunk(ref, target), lightningBlockDelay);
+                return;
+            }
+        }
+        infectChunk(ref, null);
+    }
+
+    private Block findGrass(World w, ChunkRef ref) {
+        for (int i = 0; i < 24; i++) {
+            int bx = (ref.x() << 4) + rnd.nextInt(16);
+            int bz = (ref.z() << 4) + rnd.nextInt(16);
+            int y = w.getHighestBlockYAt(bx, bz, org.bukkit.HeightMap.MOTION_BLOCKING_NO_LEAVES);
+            Block b = w.getBlockAt(bx, y, bz);
+            if (b.getType() == Material.GRASS_BLOCK) return b;
+        }
+        return null;
+    }
+
+    private void infectChunk(ChunkRef ref, Block forced) {
+        World w = ref.world();
+        if (!w.isChunkLoaded(ref.x(), ref.z())) return;
+        if (forced != null && forced.getType() == Material.GRASS_BLOCK) infect(forced);
         int baseX = ref.x() << 4;
         int baseZ = ref.z() << 4;
         for (int x = 0; x < 16; x++) {
@@ -211,25 +249,9 @@ public class NetherBlight extends JavaPlugin implements Listener {
                 int bz = baseZ + z;
                 int y = w.getHighestBlockYAt(bx, bz, org.bukkit.HeightMap.MOTION_BLOCKING_NO_LEAVES);
                 Block b = w.getBlockAt(bx, y, bz);
-                if (b.getType() == Material.GRASS_BLOCK) {
-                    infect(b);
-                    if (strike == null) strike = b;
-                }
+                if (b.getType() == Material.GRASS_BLOCK) infect(b);
             }
         }
-        if (wantsStrike && strike != null) strikeLater(w, strike);
-    }
-
-    private void strikeLater(World w, Block b) {
-        long delay = lightningMaxDelay > 0 ? rnd.nextInt(lightningMaxDelay) : 0;
-        Bukkit.getScheduler().runTaskLater(this, () -> {
-            Location loc = b.getLocation().add(0.5, 1, 0.5);
-            if (lightningReal) {
-                w.strikeLightning(loc);
-            } else {
-                w.strikeLightningEffect(loc); // только вспышка и гром, без урона и огня
-            }
-        }, delay);
     }
 
     private void infect(Block b) {
@@ -260,14 +282,22 @@ public class NetherBlight extends JavaPlugin implements Listener {
     @Override
     public boolean onCommand(CommandSender s, Command cmd, String label, String[] a) {
         if (a.length == 0) {
-            s.sendMessage("/netherblight run | mark <игрок> | unmark <игрок> | reload");
+            s.sendMessage("/netherblight run | status | mark <игрок> | unmark <игрок> | reload");
             return true;
         }
         switch (a[0].toLowerCase()) {
             case "run" -> s.sendMessage("Цикл запущен, игроков: " + runCycle());
             case "reload" -> {
                 loadSettings();
-                s.sendMessage("Конфиг перезагружен.");
+                scheduleNext(); // таймер перезапускается с новым интервалом
+                s.sendMessage("Конфиг перезагружен, таймер перезапущен.");
+            }
+            case "status" -> {
+                long sec = Math.max(0, (nextCycleAt - System.currentTimeMillis()) / 1000);
+                int marked = 0;
+                for (Player p : Bukkit.getOnlinePlayers()) if (visited(p)) marked++;
+                s.sendMessage("До следующего цикла: " + (sec / 60) + " мин " + (sec % 60) + " с");
+                s.sendMessage("Игроков с меткой онлайн: " + marked + ", чанков в очереди: " + queue.size());
             }
             case "mark", "unmark" -> {
                 if (a.length < 2) {
